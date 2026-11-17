@@ -25,7 +25,12 @@ import numpy as np
 import pefile
 from sklearn.feature_extraction import FeatureHasher
 import signify
-from signify.authenticode import SignedPEFile
+
+try:
+    from signify.authenticode import SignedPEFile
+except ImportError:  # signify >= 0.9 moved the class to a submodule
+    from signify.authenticode.signed_file import SignedPEFile
+
 from datetime import datetime
 
 
@@ -905,6 +910,19 @@ class RichHeader(FeatureType):
         return np.hstack([number_of_pairs, paired_values_hashed]).astype(np.float32)
 
 
+def _iter_signed_datas(signed_pe):
+    """
+    Iterate over a PE file's Authenticode signatures across signify versions.
+
+    signify 0.9 renamed SignedPEFile.iter_signed_datas() to
+    iter_embedded_signatures(); both return the same objects with the same
+    defaults.
+    """
+    if hasattr(signed_pe, "iter_signed_datas"):
+        return signed_pe.iter_signed_datas()
+    return signed_pe.iter_embedded_signatures()
+
+
 class AuthenticodeSignature(FeatureType):
     """
     Extracts Authenticode Digital Signature features
@@ -932,7 +950,7 @@ class AuthenticodeSignature(FeatureType):
         }
         try:
             signed_pe = SignedPEFile(io.BytesIO(bytez))
-            for signed_data in signed_pe.iter_signed_datas():
+            for signed_data in _iter_signed_datas(signed_pe):
                 raw_obj["num_certs"] += 1
                 if signed_data.signer_info.program_name is None:
                     raw_obj["empty_program_name"] = 1

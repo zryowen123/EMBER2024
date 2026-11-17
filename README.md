@@ -142,7 +142,18 @@ Check out the ```examples/``` directory for more example code!
 ember2024-notebook.ipynb -- Explore the EMBER2024 dataset
 train_lgbm.py -- Train a LightGBM classifier
 eval_lgbm.py -- Evaluate a classifier on the test and challenge sets
+detect_sample.py -- Detect a single file with the benchmark models
 ```
+
+To classify one file, download the models (or just the ones you need) and run:
+
+```
+python examples/detect_sample.py /path/to/sample.bin
+python examples/detect_sample.py /path/to/sample.bin --tags packer,behavior --json
+```
+
+The script detects the file type, loads the matching malicious/benign model, and
+extracts features once. Family and tag models are opt-in.
 
 
 ## Dataset Methodology

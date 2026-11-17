@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# EMBER2024 data and model artifacts
+model/
+data/
+X_*.dat
+y_*.dat
+Classifier_ROC_AUC.pdf
+CLAUDE.md
