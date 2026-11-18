@@ -7,7 +7,11 @@ with ``thrember.vectorize_subset`` (feature version 3, 2568 dims) and scored
 with either a pretrained model or one trained here.
 
 Examples:
-    # Score with a pretrained benchmark model
+    # Route each PE to its Win32/Win64/.NET model (all for other files)
+    python examples/evaluate_features.py features.jsonl \
+        --models-dir model --target-fpr 0.01 0.001
+
+    # Score everything with one pretrained benchmark model
     python examples/evaluate_features.py features.jsonl \
         --model model/EMBER2024_all.model --target-fpr 0.01 0.001
 
@@ -18,6 +22,22 @@ Examples:
     # Train/evaluate with a stratified split of one file
     python examples/evaluate_features.py features.jsonl \
         --train --test-size 0.3 --seed 42
+
+With ``--models-dir``, records are routed the same way
+``examples/detect_sample.py`` routes files: .NET (COM descriptor present) ->
+``Dot_Net``, PE32+ / AMD64 / ARM64 -> ``Win64``, other PEs -> ``Win32``, and
+non-PE or unparsable records -> ``all``.
+
+Scores from separately trained models are not on a common scale, so routed
+evaluation separates two kinds of results:
+
+* Threshold-free metrics are reported on the pooled scores and, additionally,
+  as sample-count-weighted averages of the per-type AUC/AP.
+* Threshold-dependent operating points pick one threshold per model type (the
+  type's own threshold at each target FPR, at 0.5, or at that type's best F1),
+  apply it to that type's rows, then sum the per-type TP/FP/TN/FN into a single
+  overall confusion matrix. The chosen thresholds and per-type metrics are
+  printed and written to the JSON output.
 
 The input must contain both label=0 and label=1 records. Unlabeled records
 (label=-1) are ignored. Metrics are printed to stdout; LightGBM logs go to
@@ -72,7 +92,17 @@ EMBER2024_FALLBACK_TRAIN_PARAMS = {
 }
 EMBER_NUM_BOOST_ROUND = 1000
 DEFAULT_TRAIN_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lgbm_config.json")
+DEFAULT_MODELS_DIR = Path(__file__).resolve().parent.parent / "model"
 FEATURE_DIM = 2568
+
+# Per-type binary models used by --models-dir, mirroring detect_sample.py.
+ROUTED_MODEL_FILES = {
+    "Win32": "EMBER2024_Win32.model",
+    "Win64": "EMBER2024_Win64.model",
+    "Dot_Net": "EMBER2024_Dot_Net.model",
+    "all": "EMBER2024_all.model",
+}
+FALLBACK_TYPE = "all"
 
 
 def configure_lightgbm_logging(verbose: bool) -> None:
@@ -166,6 +196,113 @@ def load_binary_model(path: str) -> lgb.Booster:
             "iteration); this script evaluates binary malicious/benign models only"
         )
     return model
+
+
+def load_routed_models(models_dir: Path) -> Dict[str, lgb.Booster]:
+    """Load the per-type binary models used by --models-dir."""
+    models: Dict[str, lgb.Booster] = {}
+    missing: List[str] = []
+    for model_type, filename in ROUTED_MODEL_FILES.items():
+        path = models_dir / filename
+        if not path.is_file():
+            missing.append(str(path))
+            continue
+        models[model_type] = load_binary_model(str(path))
+    if missing:
+        raise SystemExit(
+            "model files not found:\n  "
+            + "\n  ".join(missing)
+            + "\nDownload them with thrember.download_models() or: hf download "
+            "joyce8/EMBER2024-benchmark-models --repo-type model"
+        )
+    return models
+
+
+WIN64_MACHINES = frozenset({"IMAGE_FILE_MACHINE_AMD64", "IMAGE_FILE_MACHINE_ARM64"})
+PE32_PLUS_MAGIC = 0x20B
+COM_DESCRIPTOR = "COM_DESCRIPTOR"
+
+
+def record_file_type(record: Dict[str, Any]) -> str:
+    """Route a raw-feature record like detect_sample.detect_file_type().
+
+    The original bytes are not available here, so the same decision is made
+    from the extracted PE features: pefile parse success, COM descriptor
+    presence, machine type and optional-header magic.
+    """
+    general = record.get("general") or {}
+    if not general.get("is_pe"):
+        return FALLBACK_TYPE
+
+    for directory in record.get("datadirectories") or []:
+        if isinstance(directory, dict) and directory.get("name") == COM_DESCRIPTOR:
+            if directory.get("virtual_address", 0):
+                return "Dot_Net"
+            break
+
+    header = record.get("header") or {}
+    machine = (header.get("coff") or {}).get("machine", "")
+    magic = (header.get("optional") or {}).get("magic", 0)
+    if machine in WIN64_MACHINES or magic == PE32_PLUS_MAGIC:
+        return "Win64"
+    return "Win32"
+
+
+def read_record_types(paths: Sequence[str]) -> np.ndarray:
+    """Per-record model routing keys, in the same order as the JSONL rows."""
+    types: List[str] = []
+    for path in paths:
+        try:
+            handle = open(path, encoding="utf-8")
+        except OSError as exc:
+            raise SystemExit(f"cannot read {path}: {exc}") from exc
+        with handle:
+            for line_no, line in enumerate(handle, 1):
+                if not line.strip():
+                    raise SystemExit(f"blank line in {path}:{line_no}")
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise SystemExit(
+                        f"invalid JSON in {path}:{line_no}: {exc}"
+                    ) from exc
+                types.append(record_file_type(obj))
+    return np.asarray(types)
+
+
+def predict_routed_scores(
+    models: Dict[str, lgb.Booster],
+    X: np.ndarray,
+    mask: np.ndarray,
+    types: np.ndarray,
+) -> np.ndarray:
+    """Score each selected row with the model chosen for its file type."""
+    if len(types) != X.shape[0]:
+        raise SystemExit(
+            f"routing metadata covers {len(types)} records but {X.shape[0]} "
+            "rows were vectorized"
+        )
+    n = int(np.count_nonzero(mask))
+    scores = np.empty(n, dtype=np.float64)
+    out = 0
+    chunk_size = 100_000
+    for start in range(0, X.shape[0], chunk_size):
+        end = min(start + chunk_size, X.shape[0])
+        rows = np.flatnonzero(mask[start:end]) + start
+        if rows.size == 0:
+            continue
+        chunk_types = types[rows]
+        chunk_scores = np.empty(rows.size, dtype=np.float64)
+        for model_type, model in models.items():
+            selected = chunk_types == model_type
+            if not selected.any():
+                continue
+            chunk_scores[selected] = model.predict(np.asarray(X[rows[selected]]))
+        scores[out : out + rows.size] = chunk_scores
+        out += rows.size
+    if out != n:
+        raise RuntimeError(f"predicted {out} scores, expected {n}")
+    return scores
 
 
 def safe_div(numerator: float, denominator: float) -> float:
@@ -442,11 +579,15 @@ def print_operating_points(points: List[Tuple[str, Dict[str, Any]]]) -> None:
                 target_text = "-"
             else:
                 target_text = str(target)
-        threshold = point.get("threshold", point.get("threshold_used"))
-        if threshold is None and "threshold" in point:
-            threshold_text = "inf"
+        if "thresholds" in point:
+            # Routed evaluation: each model type has its own threshold.
+            threshold_text = "per-type"
         else:
-            threshold_text = format_float(threshold, 4)
+            threshold = point.get("threshold", point.get("threshold_used"))
+            if threshold is None and "threshold" in point:
+                threshold_text = "inf"
+            else:
+                threshold_text = format_float(threshold, 4)
         print(
             f"{name:<18}{target_text:>8}"
             f"{point.get('fpr', point.get('achieved_fpr', 0.0)):>9.4f}"
@@ -518,6 +659,162 @@ def evaluate(
     }
 
 
+def json_threshold(value: Optional[float]) -> Optional[float]:
+    """Represent an infinite/absent threshold as null in JSON output."""
+    if value is None or not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def type_threshold_for_fpr(y: np.ndarray, scores: np.ndarray, target_fpr: float) -> float:
+    """Threshold for one model type at a target FPR.
+
+    Scores from different models are not on a common scale, so each type gets
+    its own threshold. Types without both classes fall back to 0.5.
+    """
+    if not (np.any(y == 0) and np.any(y == 1)):
+        return 0.5
+    threshold = operating_point(y, scores, target_fpr)["threshold"]
+    # operating_point() reports an infinite threshold as None.
+    return math.inf if threshold is None else float(threshold)
+
+
+def type_best_f1_threshold(y: np.ndarray, scores: np.ndarray) -> float:
+    if not (np.any(y == 0) and np.any(y == 1)):
+        return 0.5
+    threshold = best_f1_point(y, scores).get("threshold_used")
+    return 0.5 if threshold is None else float(threshold)
+
+
+def aggregate_thresholds(
+    labels: np.ndarray,
+    scores: np.ndarray,
+    types: np.ndarray,
+    thresholds: Dict[str, float],
+) -> Dict[str, Any]:
+    """Apply one threshold per model type and aggregate the confusion counts."""
+    predictions = np.zeros(len(labels), dtype=bool)
+    for model_type, threshold in thresholds.items():
+        selected = types == model_type
+        if selected.any():
+            predictions[selected] = scores[selected] >= threshold
+    result = classification_metrics(labels, predictions)
+    result["thresholds"] = {
+        model_type: json_threshold(threshold)
+        for model_type, threshold in thresholds.items()
+    }
+    return result
+
+
+def evaluate_routed(
+    labels: np.ndarray,
+    scores: np.ndarray,
+    types: np.ndarray,
+    target_fprs: Sequence[float],
+    partial_auc_max_fpr: float,
+) -> Dict[str, Any]:
+    """Overall evaluation when samples were scored by different models.
+
+    Threshold-free metrics (ROC AUC, AP, Brier, log loss) are computed on the
+    pooled scores. Threshold-dependent operating points are built by choosing a
+    threshold per model type and summing the per-type confusion counts, so each
+    model is thresholded on its own score scale. Type-weighted AUC/AP are also
+    reported because pooling scores from separately trained models can distort
+    the global ranking.
+    """
+    base = evaluate(labels, scores, target_fprs, partial_auc_max_fpr)
+    metrics = dict(base["metrics"])
+    present_types = [mt for mt in ROUTED_MODEL_FILES if np.any(types == mt)]
+
+    per_type: Dict[str, Dict[str, Any]] = {}
+    fpr_thresholds: Dict[str, Dict[float, float]] = {}
+    best_f1_thresholds: Dict[str, float] = {}
+    for model_type in ROUTED_MODEL_FILES:
+        selected = types == model_type
+        n = int(np.count_nonzero(selected))
+        entry: Dict[str, Any] = {
+            "count": n,
+            "positive": 0,
+            "negative": 0,
+            "roc_auc": None,
+            "average_precision": None,
+            "threshold_for_target_fpr": {},
+            "best_f1_threshold": None,
+        }
+        numeric_targets: Dict[float, float] = {}
+        if n:
+            y_t = labels[selected]
+            s_t = scores[selected]
+            n_pos_t = int(np.sum(y_t == 1))
+            n_neg_t = int(np.sum(y_t == 0))
+            entry["positive"] = n_pos_t
+            entry["negative"] = n_neg_t
+            if n_pos_t and n_neg_t:
+                entry["roc_auc"] = float(roc_auc_score(y_t, s_t))
+                entry["average_precision"] = float(
+                    average_precision_score(y_t, s_t)
+                )
+            for target in target_fprs:
+                numeric_targets[target] = type_threshold_for_fpr(y_t, s_t, target)
+            best_f1_thresholds[model_type] = type_best_f1_threshold(y_t, s_t)
+            entry["threshold_for_target_fpr"] = {
+                f"{target:g}": json_threshold(threshold)
+                for target, threshold in numeric_targets.items()
+            }
+            entry["best_f1_threshold"] = json_threshold(
+                best_f1_thresholds[model_type]
+            )
+        fpr_thresholds[model_type] = numeric_targets
+        per_type[model_type] = entry
+
+    points: List[Tuple[str, Dict[str, Any]]] = []
+    for target in target_fprs:
+        thresholds = {
+            model_type: fpr_thresholds[model_type][target]
+            for model_type in present_types
+        }
+        point = aggregate_thresholds(labels, scores, types, thresholds)
+        point["name"] = f"target_fpr_{target:g}"
+        point["target_fpr"] = float(target)
+        point["achieved_fpr"] = point["fpr"]
+        points.append((f"target FPR {target:g}", point))
+    point = aggregate_thresholds(
+        labels, scores, types, {mt: 0.5 for mt in present_types}
+    )
+    point["name"] = "threshold_0.5"
+    points.append(("threshold 0.5", point))
+    point = aggregate_thresholds(
+        labels,
+        scores,
+        types,
+        {mt: best_f1_thresholds[mt] for mt in present_types},
+    )
+    point["name"] = "best_f1"
+    points.append(("best F1", point))
+
+    def weighted_mean(key: str) -> Optional[float]:
+        pairs = [
+            (entry["count"], entry[key])
+            for entry in per_type.values()
+            if entry["count"] and entry[key] is not None
+        ]
+        total = sum(count for count, _ in pairs)
+        if not total:
+            return None
+        return float(sum(count * value for count, value in pairs) / total)
+
+    metrics["type_weighted_roc_auc"] = weighted_mean("roc_auc")
+    metrics["type_weighted_average_precision"] = weighted_mean("average_precision")
+    metrics["operating_points"] = [point for _, point in points]
+    return {
+        "metrics": metrics,
+        "operating_points_named": points,
+        "counts": base["counts"],
+        "score_stats": base["score_stats"],
+        "per_type": per_type,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -532,6 +829,19 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "pretrained binary LightGBM model (.txt), e.g. "
             "model/EMBER2024_all.model or one trained by train_lgbm.py"
+        ),
+    )
+    source.add_argument(
+        "--models-dir",
+        nargs="?",
+        const=str(DEFAULT_MODELS_DIR),
+        default=None,
+        metavar="DIR",
+        help=(
+            "route each record to its Win32/Win64/Dot_Net binary model "
+            "(Dot_Net if a COM descriptor exists, Win64 for PE32+/AMD64/ARM64, "
+            "Win32 otherwise) and fall back to the all model for non-PE or "
+            f"unparsable records (default dir: {DEFAULT_MODELS_DIR})"
         ),
     )
     source.add_argument(
@@ -596,6 +906,9 @@ def run(args: argparse.Namespace) -> int:
     else:
         workdir = tempfile.mkdtemp(prefix="thrember_eval_")
     remove_workdir = not args.keep_workdir
+    routing_counts: Optional[Dict[str, int]] = None
+    routed_models_dir: Optional[Path] = None
+    eval_types: Optional[np.ndarray] = None
     try:
         if args.model:
             if not os.path.exists(args.model):
@@ -614,6 +927,34 @@ def run(args: argparse.Namespace) -> int:
                     "version 3 (2568 dims)"
                 )
             scores = predict_scores(model, X, mask)
+            train_info = None
+            eval_files = args.features
+            eval_split = "eval"
+        elif args.models_dir:
+            routed_models_dir = Path(args.models_dir)
+            X, y, extractor = vectorize(args.features, workdir, "eval")
+            mask = np.asarray(y) != -1
+            eval_indices = np.flatnonzero(mask)
+            labels = np.asarray(y[eval_indices], dtype=np.int64)
+            if labels.size == 0:
+                raise SystemExit("no labeled records (label 0/1) in the input")
+            models = load_routed_models(routed_models_dir)
+            for model_type, loaded in models.items():
+                if loaded.num_feature() != X.shape[1]:
+                    raise SystemExit(
+                        f"{ROUTED_MODEL_FILES[model_type]} expects "
+                        f"{loaded.num_feature()} features but the JSONL produced "
+                        f"{X.shape[1]}; the input must be EMBER2024 feature "
+                        "version 3 (2568 dims)"
+                    )
+            types = read_record_types(args.features)
+            scores = predict_routed_scores(models, X, mask, types)
+            eval_types = types[eval_indices]
+            routing_counts = {
+                model_type: int(np.count_nonzero(eval_types == model_type))
+                for model_type in ROUTED_MODEL_FILES
+            }
+            # Types with no records are not passed to the evaluator.
             train_info = None
             eval_files = args.features
             eval_split = "eval"
@@ -696,7 +1037,14 @@ def run(args: argparse.Namespace) -> int:
 
         if labels.size == 0:
             raise SystemExit("no labeled records to evaluate")
-        results = evaluate(labels, scores, args.target_fpr, args.partial_auc_max_fpr)
+        if eval_types is not None:
+            results = evaluate_routed(
+                labels, scores, eval_types, args.target_fpr, args.partial_auc_max_fpr
+            )
+        else:
+            results = evaluate(
+                labels, scores, args.target_fpr, args.partial_auc_max_fpr
+            )
         n_pos = results["counts"]["positive"]
         n_neg = results["counts"]["negative"]
         warnings: List[str] = []
@@ -716,14 +1064,22 @@ def run(args: argparse.Namespace) -> int:
                 labels, scores, args.target_fpr, args.bootstrap, args.seed
             )
 
+        if args.model:
+            model_info: Dict[str, Any] = {"source": "pretrained", "path": args.model}
+        elif routed_models_dir is not None:
+            model_info = {
+                "source": "routed",
+                "path": str(routed_models_dir),
+                "files": dict(ROUTED_MODEL_FILES),
+            }
+        else:
+            model_info = {"source": "trained", "path": args.save_model or None}
+
         summary = {
             "input": list(args.features),
             "feature_version": 3,
             "feature_dim": int(extractor.dim),
-            "model": {
-                "source": "pretrained" if args.model else "trained",
-                "path": args.model if args.model else (args.save_model or None),
-            },
+            "model": model_info,
             "training": train_info,
             "counts": {
                 "evaluated": int(len(labels)),
@@ -733,6 +1089,34 @@ def run(args: argparse.Namespace) -> int:
             "score_stats": results["score_stats"],
             "warnings": warnings,
         }
+        if routing_counts is not None and "per_type" in results:
+            summary["routing"] = {
+                "counts": routing_counts,
+                "per_type": results["per_type"],
+            }
+            warnings.append(
+                "threshold-free metrics (ROC AUC, AP, partial AUC, FPR@TPR, "
+                "bootstrap) pool scores from different models; compare them with "
+                "type-weighted AUC/AP and the per-type table"
+            )
+            for model_type, count in routing_counts.items():
+                if count == 0:
+                    warnings.append(
+                        f"no evaluated records routed to {model_type}; "
+                        f"{ROUTED_MODEL_FILES[model_type]} was not used"
+                    )
+                    continue
+                entry = results["per_type"][model_type]
+                if entry["positive"] == 0 or entry["negative"] == 0:
+                    warnings.append(
+                        f"{model_type}: eval set has positive={entry['positive']}, "
+                        f"negative={entry['negative']}; AUC/AP are undefined and "
+                        "its threshold falls back to 0.5"
+                    )
+                elif entry["count"] < 30:
+                    warnings.append(
+                        f"{model_type}: only {entry['count']} evaluated records"
+                    )
         if args.bootstrap > 0:
             summary["bootstrap"] = results.get("bootstrap", {})
 
@@ -755,6 +1139,7 @@ def run(args: argparse.Namespace) -> int:
         print(
             f"Model: {summary['model']['source']}"
             + (f" ({args.model})" if args.model else "")
+            + (f" ({routed_models_dir})" if routed_models_dir is not None else "")
         )
         if train_info:
             print(
@@ -766,14 +1151,30 @@ def run(args: argparse.Namespace) -> int:
             f"(positive={n_pos}, negative={n_neg}, "
             f"prevalence={n_pos / len(labels):.4f})"
         )
+        if routing_counts is not None:
+            print(
+                "Routing: "
+                + ", ".join(f"{k}={v}" for k, v in routing_counts.items())
+            )
         metrics = results["metrics"]
-        print(f"ROC AUC: {metrics['roc_auc']:.6f}")
+        routed = "per_type" in results
+        pooled_suffix = " (pooled scores)" if routed else ""
+        print(f"ROC AUC{pooled_suffix}: {metrics['roc_auc']:.6f}")
         if metrics.get("partial_auc") is not None:
             print(
-                f"Partial AUC (FPR<={metrics['partial_auc_max_fpr']:g}): "
-                f"{metrics['partial_auc']:.6f}"
+                f"Partial AUC (FPR<={metrics['partial_auc_max_fpr']:g})"
+                f"{pooled_suffix}: {metrics['partial_auc']:.6f}"
             )
-        print(f"PR AUC / average precision: {metrics['average_precision']:.6f}")
+        print(
+            f"PR AUC / average precision{pooled_suffix}: "
+            f"{metrics['average_precision']:.6f}"
+        )
+        if metrics.get("type_weighted_roc_auc") is not None:
+            print(
+                f"Type-weighted ROC AUC: {metrics['type_weighted_roc_auc']:.6f}; "
+                f"type-weighted AP: "
+                f"{metrics['type_weighted_average_precision']:.6f}"
+            )
         print(f"Brier score: {metrics['brier_score']:.6f}")
         print(f"Log loss: {metrics['log_loss']:.6f}")
         fpr95 = metrics["fpr_at_tpr_0.95"]
@@ -790,8 +1191,44 @@ def run(args: argparse.Namespace) -> int:
             )
             for target, interval in boot.get("tpr_at_fpr", {}).items():
                 print(f"  TPR at FPR {target}: {interval}")
+        if routed:
+            target_labels = [f"{target:g}" for target in args.target_fpr]
+            header = (
+                f"{'type':<9}{'n':>7}{'pos':>7}{'neg':>7}"
+                f"{'AUC':>9}{'AP':>9}{'bestF1thr':>11}"
+                + "".join(f"{'thr@' + label:>12}" for label in target_labels)
+            )
+            print()
+            print("Per-type results (thresholds are per model):")
+            print(header)
+            print("-" * len(header))
+            for model_type, entry in results["per_type"].items():
+                if entry["count"] == 0:
+                    continue
+                roc_auc_text = (
+                    "-" if entry["roc_auc"] is None else f"{entry['roc_auc']:.4f}"
+                )
+                average_precision_text = (
+                    "-"
+                    if entry["average_precision"] is None
+                    else f"{entry['average_precision']:.4f}"
+                )
+                target_thresholds = "".join(
+                    f"{format_float(entry['threshold_for_target_fpr'].get(label), 4):>12}"
+                    for label in target_labels
+                )
+                print(
+                    f"{model_type:<9}{entry['count']:>7}{entry['positive']:>7}"
+                    f"{entry['negative']:>7}{roc_auc_text:>9}"
+                    f"{average_precision_text:>9}"
+                    f"{format_float(entry['best_f1_threshold'], 4):>11}"
+                    f"{target_thresholds}"
+                )
         print()
-        print("Operating points:")
+        if routed:
+            print("Operating points (each model type thresholded independently):")
+        else:
+            print("Operating points:")
         print_operating_points(results["operating_points_named"])
         print()
         print("Score distributions:")
