@@ -142,6 +142,7 @@ Check out the ```examples/``` directory for more example code!
 ember2024-notebook.ipynb -- Explore the EMBER2024 dataset
 train_lgbm.py -- Train a LightGBM classifier
 eval_lgbm.py -- Evaluate a classifier on the test and challenge sets
+eval_dataset.py -- Evaluate a model on downloaded test/challenge JSONL (eval_lgbm.py protocol)
 detect_sample.py -- Detect a single file with the benchmark models
 ```
 
