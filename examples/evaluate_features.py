@@ -39,6 +39,13 @@ evaluation separates two kinds of results:
   overall confusion matrix. The chosen thresholds and per-type metrics are
   printed and written to the JSON output.
 
+All input files of a run share one sha256 set and only the first occurrence of a
+record is kept, so duplicate JSONL rows (overlapping weekly files, the records
+stored twice in the published test zips, hand-concatenated files) are not counted
+twice. ``--keep-duplicates`` disables this. In ``--train-features`` mode the
+training files are scanned first, so evaluation records whose sha256 also appears
+in the training data are dropped.
+
 The input must contain both label=0 and label=1 records. Unlabeled records
 (label=-1) are ignored. Metrics are printed to stdout; LightGBM logs go to
 stderr.
@@ -125,12 +132,161 @@ def count_lines(paths: Sequence[str]) -> int:
     return total
 
 
+def iter_jsonl(paths: Sequence[str]) -> Iterator[Tuple[str, int, Dict[str, Any]]]:
+    """Yield (path, line number, parsed object) for every JSONL line."""
+    for path in paths:
+        try:
+            handle = open(path, encoding="utf-8")
+        except OSError as exc:
+            raise SystemExit(f"cannot read {path}: {exc}") from exc
+        with handle:
+            for line_no, line in enumerate(handle, 1):
+                if not line.strip():
+                    raise SystemExit(f"blank line in {path}:{line_no}")
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise SystemExit(f"invalid JSON in {path}:{line_no}: {exc}") from exc
+                if not isinstance(obj, dict):
+                    raise SystemExit(
+                        f"record is not a JSON object at {path}:{line_no}"
+                    )
+                yield path, line_no, obj
+
+
+def effective_label(obj: Dict[str, Any]) -> Optional[int]:
+    """The binary label of a record, or None when it is missing/unlabeled."""
+    label = obj.get("label")
+    if isinstance(label, bool) or not isinstance(label, int):
+        return None
+    return label if label in (0, 1) else None
+
+
+def dedup_masks(
+    path_groups: Sequence[Sequence[str]],
+    names: Sequence[str],
+    *,
+    enabled: bool = True,
+) -> Tuple[Optional[List[np.ndarray]], Dict[str, Any]]:
+    """Keep only the first record for each sha256 across all input files.
+
+    Returns one boolean keep-mask per path group, aligned with the physical lines
+    that ``vectorize()`` will read, plus a JSON-serializable stats dict. With
+    ``enabled=False`` the scan is skipped and no sha256 validation happens.
+
+    Groups are scanned in order, sharing one ``seen`` map. An unlabeled occurrence
+    is replaced by a later copy that has a binary label; duplicates with
+    conflicting labels abort.
+    """
+    if len(path_groups) != len(names):
+        raise ValueError("path_groups and names must have the same length")
+    if not enabled:
+        return None, {"enabled": False}
+
+    masks = [bytearray() for _ in path_groups]
+    seen: Dict[bytes, Tuple[int, int, Optional[int]]] = {}
+    group_stats: List[Dict[str, Any]] = [
+        {
+            "files": list(paths),
+            "records": 0,
+            "kept": 0,
+            "duplicates_removed": 0,
+            "replaced_unlabeled": 0,
+            "cross_group_duplicates": 0,
+        }
+        for paths in path_groups
+    ]
+
+    for group_index, paths in enumerate(path_groups):
+        stats = group_stats[group_index]
+        mask = masks[group_index]
+        for path, line_no, obj in iter_jsonl(paths):
+            raw_sha = obj.get("sha256")
+            if not isinstance(raw_sha, str) or len(raw_sha) != 64:
+                raise SystemExit(
+                    f"missing or invalid sha256 in {path}:{line_no}; pass "
+                    "--keep-duplicates to skip sha256 deduplication"
+                )
+            try:
+                digest = bytes.fromhex(raw_sha)
+            except ValueError:
+                digest = b""
+            if len(digest) != 32:
+                raise SystemExit(
+                    f"invalid sha256 in {path}:{line_no}; pass "
+                    "--keep-duplicates to skip sha256 deduplication"
+                )
+
+            label = effective_label(obj)
+            row = len(mask)
+            stats["records"] += 1
+            previous = seen.get(digest)
+            if previous is None:
+                seen[digest] = (group_index, row, label)
+                mask.append(1)
+                continue
+
+            previous_group, previous_row, previous_label = previous
+            if previous_label is None and label is not None:
+                # Prefer the labeled copy: unlabeled rows are ignored downstream.
+                masks[previous_group][previous_row] = 0
+                group_stats[previous_group]["replaced_unlabeled"] += 1
+                seen[digest] = (group_index, row, label)
+                mask.append(1)
+                continue
+
+            if (
+                previous_label is not None
+                and label is not None
+                and previous_label != label
+            ):
+                raise SystemExit(
+                    f"label conflict for sha256 {raw_sha.lower()} in "
+                    f"{path}:{line_no}: earlier record has label "
+                    f"{previous_label}, this record has label {label}; run "
+                    "examples/merge_features.py to resolve duplicates or pass "
+                    "--keep-duplicates"
+                )
+
+            mask.append(0)
+            stats["duplicates_removed"] += 1
+            if previous_group != group_index:
+                stats["cross_group_duplicates"] += 1
+
+    result_masks: List[np.ndarray] = []
+    for mask, stats in zip(masks, group_stats):
+        stats["kept"] = int(sum(mask))
+        result_masks.append(np.frombuffer(bytes(mask), dtype=np.uint8).astype(bool))
+
+    return result_masks, {
+        "enabled": True,
+        "method": "sha256",
+        "scope": "global-first-occurrence",
+        "records": sum(stats["records"] for stats in group_stats),
+        "kept": sum(stats["kept"] for stats in group_stats),
+        "duplicates_removed": sum(
+            stats["duplicates_removed"] for stats in group_stats
+        ),
+        "overlap_removed": sum(
+            stats["cross_group_duplicates"] for stats in group_stats
+        ),
+        "unlabeled_replaced": sum(
+            stats["replaced_unlabeled"] for stats in group_stats
+        ),
+        "groups": {
+            name: group_stats[index] for index, name in enumerate(names)
+        },
+    }
+
+
 def vectorize(
     paths: Sequence[str],
     workdir: str,
     prefix: str,
+    nrows: Optional[int] = None,
 ) -> Tuple[np.memmap, np.memmap, PEFeatureExtractor]:
-    nrows = count_lines(paths)
+    if nrows is None:
+        nrows = count_lines(paths)
     if nrows == 0:
         raise SystemExit(f"no records in {', '.join(paths)}")
     extractor = PEFeatureExtractor()
@@ -251,22 +407,8 @@ def record_file_type(record: Dict[str, Any]) -> str:
 def read_record_types(paths: Sequence[str]) -> np.ndarray:
     """Per-record model routing keys, in the same order as the JSONL rows."""
     types: List[str] = []
-    for path in paths:
-        try:
-            handle = open(path, encoding="utf-8")
-        except OSError as exc:
-            raise SystemExit(f"cannot read {path}: {exc}") from exc
-        with handle:
-            for line_no, line in enumerate(handle, 1):
-                if not line.strip():
-                    raise SystemExit(f"blank line in {path}:{line_no}")
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise SystemExit(
-                        f"invalid JSON in {path}:{line_no}: {exc}"
-                    ) from exc
-                types.append(record_file_type(obj))
+    for _, _, obj in iter_jsonl(paths):
+        types.append(record_file_type(obj))
     return np.asarray(types)
 
 
@@ -482,22 +624,14 @@ def bootstrap_ci(
 
 
 def iter_records(paths: Sequence[str]) -> Iterator[Dict[str, Any]]:
-    for path in paths:
-        with open(path, encoding="utf-8") as handle:
-            for line_no, line in enumerate(handle, 1):
-                if not line.strip():
-                    raise SystemExit(f"blank line in {path}:{line_no}")
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise SystemExit(f"invalid JSON in {path}:{line_no}: {exc}") from exc
-                source = obj.get("source") or {}
-                yield {
-                    "sha256": obj.get("sha256", ""),
-                    "label": obj.get("label"),
-                    "archive": source.get("archive", ""),
-                    "member": source.get("member", ""),
-                }
+    for _, _, obj in iter_jsonl(paths):
+        source = obj.get("source") or {}
+        yield {
+            "sha256": obj.get("sha256", ""),
+            "label": obj.get("label"),
+            "archive": source.get("archive", ""),
+            "member": source.get("member", ""),
+        }
 
 
 def write_scores_csv(
@@ -867,6 +1001,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.005,
         help="partial ROC AUC restricted to FPR <= this value (default: 0.005; 0 disables)",
     )
+    parser.add_argument(
+        "--keep-duplicates",
+        action="store_true",
+        help=(
+            "keep records whose sha256 duplicates an earlier record; by default "
+            "all input files of the run share one sha256 set and only the first "
+            "occurrence is kept"
+        ),
+    )
     parser.add_argument("--test-size", type=float, default=0.3, help="test fraction for --train")
     parser.add_argument("--seed", type=int, default=42, help="random seed")
     parser.add_argument(
@@ -909,12 +1052,24 @@ def run(args: argparse.Namespace) -> int:
     routing_counts: Optional[Dict[str, int]] = None
     routed_models_dir: Optional[Path] = None
     eval_types: Optional[np.ndarray] = None
+    dedup_info: Optional[Dict[str, Any]] = None
     try:
         if args.model:
             if not os.path.exists(args.model):
                 raise SystemExit(f"model does not exist: {args.model}")
-            X, y, extractor = vectorize(args.features, workdir, "eval")
+            keep_masks, dedup_info = dedup_masks(
+                [args.features], ["eval"], enabled=not args.keep_duplicates
+            )
+            keep = None if keep_masks is None else keep_masks[0]
+            X, y, extractor = vectorize(
+                args.features,
+                workdir,
+                "eval",
+                nrows=None if keep is None else len(keep),
+            )
             mask = np.asarray(y) != -1
+            if keep is not None:
+                mask &= keep
             eval_indices = np.flatnonzero(mask)
             labels = np.asarray(y[eval_indices], dtype=np.int64)
             if labels.size == 0:
@@ -932,8 +1087,19 @@ def run(args: argparse.Namespace) -> int:
             eval_split = "eval"
         elif args.models_dir:
             routed_models_dir = Path(args.models_dir)
-            X, y, extractor = vectorize(args.features, workdir, "eval")
+            keep_masks, dedup_info = dedup_masks(
+                [args.features], ["eval"], enabled=not args.keep_duplicates
+            )
+            keep = None if keep_masks is None else keep_masks[0]
+            X, y, extractor = vectorize(
+                args.features,
+                workdir,
+                "eval",
+                nrows=None if keep is None else len(keep),
+            )
             mask = np.asarray(y) != -1
+            if keep is not None:
+                mask &= keep
             eval_indices = np.flatnonzero(mask)
             labels = np.asarray(y[eval_indices], dtype=np.int64)
             if labels.size == 0:
@@ -959,8 +1125,19 @@ def run(args: argparse.Namespace) -> int:
             eval_files = args.features
             eval_split = "eval"
         elif args.train:
-            X_all, y_all, extractor = vectorize(args.features, workdir, "all")
+            keep_masks, dedup_info = dedup_masks(
+                [args.features], ["input"], enabled=not args.keep_duplicates
+            )
+            keep = None if keep_masks is None else keep_masks[0]
+            X_all, y_all, extractor = vectorize(
+                args.features,
+                workdir,
+                "all",
+                nrows=None if keep is None else len(keep),
+            )
             label_mask = np.asarray(y_all) != -1
+            if keep is not None:
+                label_mask &= keep
             labeled_positions = np.flatnonzero(label_mask)
             labels_all = np.asarray(y_all[labeled_positions], dtype=np.int64)
             if labels_all.size == 0:
@@ -1001,17 +1178,36 @@ def run(args: argparse.Namespace) -> int:
             eval_files = args.features
             eval_split = "test"
         else:
+            keep_masks, dedup_info = dedup_masks(
+                [args.train_features, args.features],
+                ["train", "eval"],
+                enabled=not args.keep_duplicates,
+            )
+            train_keep = None if keep_masks is None else keep_masks[0]
+            eval_keep = None if keep_masks is None else keep_masks[1]
             X_train_mm, y_train_mm, extractor = vectorize(
-                args.train_features, workdir, "train"
+                args.train_features,
+                workdir,
+                "train",
+                nrows=None if train_keep is None else len(train_keep),
             )
             train_mask = np.asarray(y_train_mm) != -1
+            if train_keep is not None:
+                train_mask &= train_keep
             train_pos = np.flatnonzero(train_mask)
             X_train = np.asarray(X_train_mm[train_pos])
             y_train = np.asarray(y_train_mm[train_pos], dtype=np.int64)
             if len(np.unique(y_train)) < 2:
                 raise SystemExit("training features need both label=0 and label=1")
-            X_eval_mm, y_eval_mm, _ = vectorize(args.features, workdir, "eval")
+            X_eval_mm, y_eval_mm, _ = vectorize(
+                args.features,
+                workdir,
+                "eval",
+                nrows=None if eval_keep is None else len(eval_keep),
+            )
             eval_mask = np.asarray(y_eval_mm) != -1
+            if eval_keep is not None:
+                eval_mask &= eval_keep
             eval_indices = np.flatnonzero(eval_mask)
             labels = np.asarray(y_eval_mm[eval_indices], dtype=np.int64)
             X_eval = np.asarray(X_eval_mm[eval_indices])
@@ -1048,6 +1244,23 @@ def run(args: argparse.Namespace) -> int:
         n_pos = results["counts"]["positive"]
         n_neg = results["counts"]["negative"]
         warnings: List[str] = []
+        if dedup_info and dedup_info.get("enabled"):
+            if dedup_info["duplicates_removed"]:
+                warnings.append(
+                    f"deduplicated {dedup_info['duplicates_removed']} duplicate "
+                    f"record(s) by sha256 (kept {dedup_info['kept']} of "
+                    f"{dedup_info['records']}); pass --keep-duplicates to disable"
+                )
+            if dedup_info["overlap_removed"]:
+                warnings.append(
+                    f"removed {dedup_info['overlap_removed']} evaluation record(s) "
+                    "whose sha256 also appeared in the training features"
+                )
+            if dedup_info["unlabeled_replaced"]:
+                warnings.append(
+                    f"{dedup_info['unlabeled_replaced']} earlier unlabeled "
+                    "duplicate(s) were replaced by a later labeled copy"
+                )
         if n_pos < 30 or n_neg < 30:
             warnings.append(
                 f"small evaluation set (positive={n_pos}, negative={n_neg}); "
@@ -1077,6 +1290,7 @@ def run(args: argparse.Namespace) -> int:
 
         summary = {
             "input": list(args.features),
+            "dedup": dedup_info or {"enabled": False},
             "feature_version": 3,
             "feature_dim": int(extractor.dim),
             "model": model_info,
@@ -1136,6 +1350,17 @@ def run(args: argparse.Namespace) -> int:
                 json.dump(summary, handle, indent=2, ensure_ascii=False, allow_nan=False)
 
         print(f"Input: {', '.join(args.features)}")
+        if dedup_info and dedup_info.get("enabled"):
+            print(
+                f"Dedup: kept {dedup_info['kept']} of {dedup_info['records']} "
+                f"records ({dedup_info['duplicates_removed']} duplicates removed "
+                "by sha256)"
+            )
+            if dedup_info["overlap_removed"]:
+                print(
+                    f"Dedup: {dedup_info['overlap_removed']} evaluation record(s) "
+                    "also present in the training features were removed"
+                )
         print(
             f"Model: {summary['model']['source']}"
             + (f" ({args.model})" if args.model else "")
