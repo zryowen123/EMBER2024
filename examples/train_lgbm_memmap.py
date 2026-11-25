@@ -12,13 +12,15 @@ from the ``.dat`` memmap into LightGBM in batches instead:
 * The 10% validation split is index-based, not a copy of X.
 * ``lightgbm.Sequence`` pushes rows to the Dataset in ``--batch-size`` chunks.
 
-Peak RSS is roughly the binned Dataset (~1 byte per feature per row, ~6.7 GB
-for the full training set) plus one batch, instead of several copies of X.
+Peak memory is the binned Dataset (~1 byte per feature per row, ~6.7 GB for the
+full training set), the bin-construction sample (200k rows as float64, ~4 GB),
+one batch, and resident memmap pages (clean and reclaimable), instead of several
+copies of X.
 
 Usage:
     python examples/train_lgbm_memmap.py <data_dir> <model_path> \
         [--config-file examples/lgbm_config.json] \
-        [--batch-size 4096] [--bin-sample-count 20000] \
+        [--batch-size 4096] [--bin-sample-count 200000] \
         [--no-valid] [--threads N]
 """
 
@@ -117,9 +119,9 @@ def main() -> None:
     parser.add_argument(
         "--bin-sample-count",
         type=int,
-        default=20000,
+        default=200000,
         help="rows sampled to build feature bins (LightGBM default 200000 uses ~4 GB "
-        "as float64; 20000 uses ~0.4 GB)",
+        "as float64 and avoids its small-sample warning; 20000 uses ~0.4 GB)",
     )
     parser.add_argument(
         "--no-valid",
