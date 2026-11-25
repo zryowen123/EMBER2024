@@ -91,6 +91,33 @@ def open_memmap(path: str, dtype, shape=None) -> np.memmap:
     return np.memmap(path, dtype=dtype, mode="r", shape=shape)
 
 
+def progress_callback(period: int, start_time: float):
+    """Print iteration progress (and validation metrics) every ``period`` rounds."""
+
+    state = {"t0": start_time, "started": False}
+
+    def _callback(env: lgb.callback.CallbackEnv) -> None:
+        if not state["started"]:
+            # The first callback runs after Dataset construction, so restart the
+            # clock here: rate/ETA then describe iterations only.
+            state["t0"] = time.time()
+            state["started"] = True
+        total = env.end_iteration - env.begin_iteration
+        done = env.iteration - env.begin_iteration + 1
+        if done % period != 0 and done != total:
+            return
+        elapsed = time.time() - state["t0"]
+        rate = done / elapsed if elapsed > 0 else 0.0
+        eta = (total - done) / rate if rate > 0 else 0.0
+        parts = [f"[{done}/{total}] {elapsed:.1f}s  {rate:.1f} it/s  ETA {eta:.1f}s"]
+        for _, name, value, _ in env.evaluation_result_list or []:
+            parts.append(f"{name}={value:.5f}")
+        print("  ".join(parts), flush=True)
+
+    _callback.order = 0
+    return _callback
+
+
 def peak_rss_gb() -> float:
     # ru_maxrss is KiB on Linux and bytes on macOS.
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
@@ -133,6 +160,18 @@ def main() -> None:
         type=int,
         default=None,
         help="override LightGBM num_threads (default: use the config)",
+    )
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=10,
+        help="print training progress every N iterations (0 disables, default: 10)",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="keep LightGBM's own logging (the config sets verbosity=2, which "
+        "prints a debug block per tree); by default only progress lines are shown",
     )
     args = parser.parse_args()
 
@@ -230,6 +269,8 @@ def main() -> None:
     params = json.load(open(args.config_file, "r"))
     if args.threads is not None:
         params["num_threads"] = args.threads
+    if not args.verbose:
+        params["verbosity"] = -1
     if num_classes > 2:
         params.update(
             {
@@ -252,10 +293,15 @@ def main() -> None:
     )
 
     t0 = time.time()
+    callbacks = []
+    if args.log_every > 0:
+        callbacks.append(progress_callback(args.log_every, t0))
+        print(f"Training {params.get('num_iterations', 100)} iterations...", flush=True)
     booster = lgb.train(
         params,
         train_set,
         valid_sets=valid_sets if valid_sets else None,
+        callbacks=callbacks or None,
     )
     elapsed = time.time() - t0
 
